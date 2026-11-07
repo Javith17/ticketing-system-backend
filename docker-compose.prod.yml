@@ -1,0 +1,63 @@
+# Production stack for the Hostinger VPS, driven by Jenkins (see Jenkinsfile).
+#
+# Run with the server-side env file so ${PG_*} below are interpolated too:
+#   docker compose -p ticketing-backend -f docker-compose.prod.yml \
+#     --env-file /opt/ticketing/backend.env up -d --build
+#
+# Both ports are bound to 127.0.0.1 only: the API is reached through the host
+# nginx (/api/ -> 127.0.0.1:3000) and Postgres is never exposed publicly
+# (use an SSH tunnel for DB tools).
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: ticketing-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${PG_USERNAME}
+      POSTGRES_PASSWORD: ${PG_PASSWORD}
+      POSTGRES_DB: ${PG_DB:-ticketing_system}
+    ports:
+      - '127.0.0.1:5432:5432'
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U ${PG_USERNAME} -d ${PG_DB:-ticketing_system}']
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: ticketing-backend:latest
+    container_name: ticketing-backend
+    restart: unless-stopped
+    env_file:
+      - /opt/ticketing/backend.env
+    environment:
+      NODE_ENV: production
+      PORT: 3000
+      PG_HOST: postgres
+      PG_PORT: 5432
+      UPLOAD_DIR: ./uploads
+    ports:
+      - '127.0.0.1:3000:3000'
+    volumes:
+      # Bind mount so uploaded images survive rebuilds and are easy to back up.
+      - /opt/ticketing/uploads:/app/uploads
+      # Optional secrets (e.g. firebase-service-account.json)
+      - /opt/ticketing/secrets:/app/secrets:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+    logging:
+      driver: json-file
+      options:
+        max-size: '10m'
+        max-file: '5'
+
+volumes:
+  pgdata:
+    name: ticketing_pgdata
