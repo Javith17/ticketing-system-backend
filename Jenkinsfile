@@ -22,7 +22,8 @@ pipeline {
     ENV_FILE     = '/opt/ticketing/backend.env'
     BACKUP_DIR   = '/opt/ticketing/backups'
     COMPOSE      = "docker compose -p ticketing-backend -f docker-compose.prod.yml --env-file /opt/ticketing/backend.env"
-    HEALTH_URL   = 'http://127.0.0.1:3000/auth/healthCheck'
+    SERVICE      = 'app'
+    REPLICAS_VAR = 'BACKEND_REPLICAS'   // replica count, set in backend.env
   }
 
   stages {
@@ -37,6 +38,8 @@ pipeline {
       steps {
         sh '''
           test -f "$ENV_FILE" || { echo "Missing $ENV_FILE on the server - see DEPLOYMENT.md"; exit 1; }
+          grep -qE '^APP_DOMAIN=.+' "$ENV_FILE" || { echo "APP_DOMAIN missing in $ENV_FILE - run deploy/traefik/install-traefik.sh"; exit 1; }
+          docker network inspect traefik >/dev/null || { echo "Docker network 'traefik' missing - run deploy/traefik/install-traefik.sh"; exit 1; }
           docker version --format 'Docker {{.Server.Version}}'
           $COMPOSE config --quiet
         '''
@@ -73,26 +76,66 @@ pipeline {
       }
     }
 
-    stage('Deploy') {
+    stage('Deploy (rolling)') {
+      // Zero-downtime: start a new set of replicas next to the old ones, wait
+      // until Docker reports them healthy (Traefik then routes to them), and
+      // only then stop the old set. If the new set never gets healthy it is
+      // removed and the old version keeps serving.
+      // The app container runs scripts/migrate.js (db/script.sql) before it starts.
       steps {
-        // The app container runs scripts/migrate.js (db/script.sql) before it starts.
-        sh '$COMPOSE up -d --remove-orphans'
+        sh '''
+          $COMPOSE up -d --wait postgres
+          OLD=$($COMPOSE ps -q "$SERVICE")
+          if [ -z "$OLD" ]; then
+            echo "No running replicas - starting fresh."
+            $COMPOSE up -d --wait --wait-timeout 240 "$SERVICE"
+            exit 0
+          fi
+          N=$(echo "$OLD" | wc -l)
+          R=$(grep -E "^$REPLICAS_VAR=" "$ENV_FILE" | tail -n1 | cut -d= -f2- | tr -dc '0-9')
+          R=${R:-2}
+          echo "Replacing $N running replica(s) with $R new one(s)..."
+          $COMPOSE up -d --no-deps --no-recreate --scale "$SERVICE=$((N + R))" "$SERVICE"
+          NEW=$($COMPOSE ps -q "$SERVICE" | grep -vxF "$OLD" || true)
+          [ -n "$NEW" ] || { echo "No new containers were created"; exit 1; }
+
+          ok=0
+          for i in $(seq 1 80); do
+            ok=1
+            for c in $NEW; do
+              st=$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "$c")
+              if [ "$st" = unhealthy ]; then
+                echo "New container $c is unhealthy:"; docker logs --tail 100 "$c"
+                docker rm -f $NEW >/dev/null; exit 1
+              fi
+              [ "$st" = healthy ] || ok=0
+            done
+            [ "$ok" = 1 ] && break
+            sleep 3
+          done
+          if [ "$ok" != 1 ]; then
+            echo "New containers did not become healthy in time; keeping the old version."
+            for c in $NEW; do docker logs --tail 60 "$c"; done
+            docker rm -f $NEW >/dev/null; exit 1
+          fi
+
+          echo "New replicas healthy. Waiting for Traefik to pick them up, then retiring the old ones."
+          sleep 5
+          docker stop -t 20 $OLD >/dev/null && docker rm $OLD >/dev/null
+          $COMPOSE ps "$SERVICE"
+        '''
       }
     }
 
-    stage('Health check') {
+    stage('Smoke test via Traefik') {
       steps {
         sh '''
-          for i in $(seq 1 30); do
-            if curl -fsS "$HEALTH_URL" >/dev/null; then
-              echo "Backend is healthy."
-              exit 0
-            fi
-            echo "Waiting for backend ($i/30)..."
-            sleep 3
-          done
-          echo "Backend did not become healthy in time."
-          exit 1
+          APP_DOMAIN=$(grep -E '^APP_DOMAIN=' "$ENV_FILE" | tail -n1 | cut -d= -f2- | tr -d '"\\r')
+          # -k: also passes while the first Let's Encrypt certificate is being issued
+          curl -fsSk --retry 10 --retry-delay 3 --retry-all-errors \\
+            --resolve "$APP_DOMAIN:443:127.0.0.1" "https://$APP_DOMAIN/api/auth/healthCheck"
+          echo
+          echo "Live at https://$APP_DOMAIN/api/"
         '''
       }
     }
@@ -101,7 +144,7 @@ pipeline {
   post {
     failure {
       sh '$COMPOSE ps || true'
-      sh '$COMPOSE logs --tail=150 app || true'
+      sh '$COMPOSE logs --tail=150 "$SERVICE" || true'
     }
     always {
       sh 'docker image prune -f >/dev/null || true'

@@ -29,10 +29,16 @@ async function main() {
   await client.connect();
   console.log(`[migrate] Applying ${sqlPath} to ${process.env.PG_DB}@${process.env.PG_HOST}...`);
 
+  // Several replicas start at once during a deploy and each runs this script.
+  // A session-level advisory lock makes them take turns, so concurrent
+  // CREATE TABLE IF NOT EXISTS / ALTER TABLE statements can't collide.
+  const LOCK_ID = 727274001;
   try {
+    await client.query('SELECT pg_advisory_lock($1)', [LOCK_ID]);
     await client.query(sql);
     console.log('[migrate] Done.');
   } finally {
+    await client.query('SELECT pg_advisory_unlock($1)', [LOCK_ID]).catch(() => {});
     await client.end();
   }
 }

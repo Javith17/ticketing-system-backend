@@ -1,0 +1,73 @@
+# Traefik edge proxy + load balancer for the whole VPS.
+# Replaces the host nginx: owns ports 80/443, gets Let's Encrypt certificates,
+# and load-balances across every replica of the frontend and backend
+# containers it discovers on the shared "traefik" Docker network.
+#
+# Lives on the server at /opt/ticketing/traefik (install-traefik.sh copies it):
+#   docker compose -p traefik -f /opt/ticketing/traefik/docker-compose.yml \
+#     --env-file /opt/ticketing/traefik/.env up -d
+
+services:
+  traefik:
+    # 3.6+ is required with Docker Engine 29 (Docker API version negotiation).
+    image: traefik:v3.7
+    container_name: traefik
+    restart: unless-stopped
+    command:
+      # Docker provider: only containers labelled traefik.enable=true are routed
+      - --providers.docker=true
+      - --providers.docker.exposedbydefault=false
+      - --providers.docker.network=traefik
+      # File provider: routes to things outside Docker (Jenkins on the host)
+      - --providers.file.directory=/etc/traefik/dynamic
+      - --providers.file.watch=true
+      # HTTP -> HTTPS everywhere (ACME HTTP challenges are still answered on :80)
+      - --entrypoints.web.address=:80
+      - --entrypoints.web.http.redirections.entrypoint.to=websecure
+      - --entrypoints.web.http.redirections.entrypoint.scheme=https
+      - --entrypoints.websecure.address=:443
+      # Let's Encrypt
+      - --certificatesresolvers.le.acme.email=${ACME_EMAIL}
+      - --certificatesresolvers.le.acme.storage=/letsencrypt/acme.json
+      - --certificatesresolvers.le.acme.httpchallenge=true
+      - --certificatesresolvers.le.acme.httpchallenge.entrypoint=web
+      # Dashboard (served only through the password-protected router below)
+      - --api.dashboard=true
+      - --ping=true
+      - --log.level=INFO
+      - --accesslog=true
+    ports:
+      - '80:80'
+      - '443:443'
+    extra_hosts:
+      # lets the file provider reach Jenkins, which runs on the host
+      - 'host.docker.internal:host-gateway'
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ./letsencrypt:/letsencrypt
+      - ./dynamic:/etc/traefik/dynamic:ro
+    networks:
+      - traefik
+    healthcheck:
+      test: ['CMD', 'traefik', 'healthcheck', '--ping']
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.dashboard.rule=Host(`${TRAEFIK_DOMAIN}`)
+      - traefik.http.routers.dashboard.entrypoints=websecure
+      - traefik.http.routers.dashboard.tls.certresolver=le
+      - traefik.http.routers.dashboard.service=api@internal
+      - traefik.http.routers.dashboard.middlewares=dashboard-auth
+      - traefik.http.middlewares.dashboard-auth.basicauth.users=${TRAEFIK_DASHBOARD_AUTH}
+    logging:
+      driver: json-file
+      options:
+        max-size: '10m'
+        max-file: '5'
+
+networks:
+  traefik:
+    name: traefik
+    external: true

@@ -1,0 +1,17 @@
+# Traefik file-provider route to Jenkins, which runs on the host (not in Docker).
+# install-traefik.sh writes /opt/ticketing/traefik/dynamic/jenkins.yml from this,
+# replacing __CI_DOMAIN__. Traefik reloads it automatically when it changes.
+http:
+  routers:
+    jenkins:
+      rule: 'Host(`__CI_DOMAIN__`)'
+      entryPoints:
+        - websecure
+      tls:
+        certResolver: le
+      service: jenkins
+  services:
+    jenkins:
+      loadBalancer:
+        servers:
+          - url: 'http://host.docker.internal:8080'

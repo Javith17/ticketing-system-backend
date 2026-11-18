@@ -98,13 +98,45 @@ curl http://127.0.0.1:3000/auth/healthCheck
 
 Swagger: `http://<VPS-IP>/api/api/docs`.
 
-## 7. Domain + HTTPS (when ready)
+## 7. Domain + HTTPS with nginx + certbot (superseded by section 8 - skip if you use Traefik)
 
 1. Point an A record at the VPS IP.
 2. Set `server_name your.domain;` in `/etc/nginx/sites-available/ticketing`, `nginx -t && systemctl reload nginx`.
 3. `apt install -y certbot python3-certbot-nginx && certbot --nginx -d your.domain`
 4. Add `https://your.domain` to `ALLOWED_ORIGINS` in `/opt/ticketing/backend.env`, rebuild the backend job.
 5. Optionally put Jenkins behind nginx too and close port 8080 to the world (GitHub webhooks then go to `https://your.domain/jenkins/github-webhook/`).
+
+## 8. Traefik load balancer + domain (replaces host nginx)
+
+Traefik owns ports 80/443, issues Let's Encrypt certificates, and round-robins
+requests across every healthy replica of the frontend (`web`) and backend
+(`app`). Jenkins deploys are rolling: new replicas start next to the old ones
+and the old ones are removed only after the new ones are healthy.
+
+```
+Browser ─https─▶ Traefik :443 ─ Host(APP_DOMAIN) + /api/* ─▶ app replicas (×BACKEND_REPLICAS) ─▶ postgres
+                              ├ Host(APP_DOMAIN)          ─▶ web replicas (×FRONTEND_REPLICAS)
+                              ├ Host(CI_DOMAIN)           ─▶ Jenkins on the host :8080
+                              └ Host(TRAEFIK_DOMAIN)      ─▶ dashboard (basic auth)
+```
+
+1. DNS: A records for `APP_DOMAIN`, `CI_DOMAIN` and `TRAEFIK_DOMAIN` → the VPS IP.
+2. On the VPS:
+   ```bash
+   curl -fsSL https://raw.githubusercontent.com/Javith17/ticketing-system-backend/development/deploy/traefik/install-traefik.sh -o install-traefik.sh
+   bash install-traefik.sh            # creates /opt/ticketing/traefik/.env, then stops
+   openssl passwd -apr1 'dashboard-password'   # paste into TRAEFIK_DASHBOARD_AUTH='admin:<hash>'
+   nano /opt/ticketing/traefik/.env
+   bash install-traefik.sh            # stops nginx, starts Traefik, updates backend.env/frontend.env
+   ```
+3. Run the backend job, then the frontend job.
+4. Jenkins → Manage Jenkins → System → Jenkins URL `https://CI_DOMAIN/`; GitHub
+   webhooks → `https://CI_DOMAIN/github-webhook/`; then `ufw delete allow 8080/tcp`.
+
+Replica counts: `BACKEND_REPLICAS` in `/opt/ticketing/backend.env`,
+`FRONTEND_REPLICAS` in `/opt/ticketing/frontend.env`; applied on the next deploy.
+Concurrent `db/script.sql` runs are serialized by an advisory lock in
+`scripts/migrate.js`.
 
 ## Hardening checklist
 

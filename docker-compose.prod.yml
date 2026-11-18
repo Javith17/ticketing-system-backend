@@ -1,12 +1,12 @@
 # Production stack for the Hostinger VPS, driven by Jenkins (see Jenkinsfile).
 #
-# Run with the server-side env file so ${PG_*} below are interpolated too:
+# Run with the server-side env file so ${PG_*} / ${APP_DOMAIN} are interpolated:
 #   docker compose -p ticketing-backend -f docker-compose.prod.yml \
-#     --env-file /opt/ticketing/backend.env up -d --build
+#     --env-file /opt/ticketing/backend.env up -d --wait
 #
-# Both ports are bound to 127.0.0.1 only: the API is reached through the host
-# nginx (/api/ -> 127.0.0.1:3000) and Postgres is never exposed publicly
-# (use an SSH tunnel for DB tools).
+# The API has no host port: Traefik (deploy/traefik) finds every "app" replica
+# on the shared "traefik" network and load-balances https://APP_DOMAIN/api/*
+# across the healthy ones. Postgres stays on 127.0.0.1:5432 for SSH tunnels.
 
 services:
   postgres:
@@ -32,8 +32,10 @@ services:
       context: .
       dockerfile: Dockerfile
     image: ticketing-backend:latest
-    container_name: ticketing-backend
+    # no container_name / host port: both would block running several replicas
     restart: unless-stopped
+    deploy:
+      replicas: ${BACKEND_REPLICAS:-2}
     env_file:
       - /opt/ticketing/backend.env
     environment:
@@ -42,13 +44,34 @@ services:
       PG_HOST: postgres
       PG_PORT: 5432
       UPLOAD_DIR: ./uploads
-    ports:
-      - '127.0.0.1:3000:3000'
     volumes:
-      # Bind mount so uploaded images survive rebuilds and are easy to back up.
+      # Shared by all replicas, so an image saved by one is served by every one.
       - /opt/ticketing/uploads:/app/uploads
       # Optional secrets (e.g. firebase-service-account.json)
       - /opt/ticketing/secrets:/app/secrets:ro
+    networks:
+      - default
+      - traefik
+    healthcheck:
+      # Traefik only sends traffic to containers Docker reports as healthy
+      test: ['CMD-SHELL', 'wget -qO /dev/null http://127.0.0.1:3000/auth/healthCheck || exit 1']
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
+    labels:
+      - traefik.enable=true
+      - traefik.docker.network=traefik
+      # https://APP_DOMAIN/api/... -> replica:3000/... (prefix stripped, as before)
+      - traefik.http.routers.ticketing-api.rule=Host(`${APP_DOMAIN}`) && PathPrefix(`/api`)
+      - traefik.http.routers.ticketing-api.entrypoints=websecure
+      - traefik.http.routers.ticketing-api.tls.certresolver=le
+      - traefik.http.routers.ticketing-api.middlewares=ticketing-api-strip
+      - traefik.http.middlewares.ticketing-api-strip.stripprefix.prefixes=/api
+      # round-robin across replicas; Traefik also probes each one itself
+      - traefik.http.services.ticketing-api.loadbalancer.server.port=3000
+      - traefik.http.services.ticketing-api.loadbalancer.healthcheck.path=/auth/healthCheck
+      - traefik.http.services.ticketing-api.loadbalancer.healthcheck.interval=10s
     depends_on:
       postgres:
         condition: service_healthy
@@ -61,3 +84,8 @@ services:
 volumes:
   pgdata:
     name: ticketing_pgdata
+
+networks:
+  traefik:
+    name: traefik
+    external: true
