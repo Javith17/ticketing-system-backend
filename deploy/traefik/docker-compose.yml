@@ -3,6 +3,11 @@
 # and load-balances across every replica of the frontend and backend
 # containers it discovers on the shared "traefik" Docker network.
 #
+# Also runs Traefik Manager (web UI at https://TM_DOMAIN): it shows every route,
+# service, certificate and access-log line, and edits the file-provider routes
+# in ./dynamic. Routes from Docker labels (the app) stay in the repos' compose
+# files and show read-only there.
+#
 # Lives on the server at /opt/ticketing/traefik (install-traefik.sh copies it):
 #   docker compose -p traefik -f /opt/ticketing/traefik/docker-compose.yml \
 #     --env-file /opt/ticketing/traefik/.env up -d
@@ -26,16 +31,23 @@ services:
       - --entrypoints.web.http.redirections.entrypoint.to=websecure
       - --entrypoints.web.http.redirections.entrypoint.scheme=https
       - --entrypoints.websecure.address=:443
+      # Internal-only entrypoint (no host port) where Traefik Manager reads the API
+      - --entrypoints.internal.address=:8080
       # Let's Encrypt
       - --certificatesresolvers.le.acme.email=${ACME_EMAIL}
       - --certificatesresolvers.le.acme.storage=/letsencrypt/acme.json
       - --certificatesresolvers.le.acme.httpchallenge=true
       - --certificatesresolvers.le.acme.httpchallenge.entrypoint=web
-      # Dashboard (served only through the password-protected router below)
-      - --api.dashboard=true
+      # API only (for Traefik Manager, via the internal entrypoint below).
+      # The built-in dashboard is off: Traefik Manager replaces it at TM_DOMAIN.
+      - --api=true
+      - --api.dashboard=false
       - --ping=true
       - --log.level=INFO
+      # Access log to a file so Traefik Manager's Logs tab can read it
+      # (rotated daily by /etc/logrotate.d/traefik)
       - --accesslog=true
+      - --accesslog.filepath=/logs/access.log
     ports:
       - '80:80'
       - '443:443'
@@ -46,6 +58,7 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock:ro
       - ./letsencrypt:/letsencrypt
       - ./dynamic:/etc/traefik/dynamic:ro
+      - ./logs:/logs
     networks:
       - traefik
     healthcheck:
@@ -55,17 +68,66 @@ services:
       retries: 3
     labels:
       - traefik.enable=true
-      - traefik.http.routers.dashboard.rule=Host(`${TRAEFIK_DOMAIN}`)
-      - traefik.http.routers.dashboard.entrypoints=websecure
-      - traefik.http.routers.dashboard.tls.certresolver=le
-      - traefik.http.routers.dashboard.service=api@internal
-      - traefik.http.routers.dashboard.middlewares=dashboard-auth
-      - traefik.http.middlewares.dashboard-auth.basicauth.users=${TRAEFIK_DASHBOARD_AUTH}
+      # Traefik API for Traefik Manager: internal entrypoint only, own password
+      - traefik.http.routers.internal-api.rule=PathPrefix(`/api`)
+      - traefik.http.routers.internal-api.entrypoints=internal
+      - traefik.http.routers.internal-api.service=api@internal
+      - traefik.http.routers.internal-api.middlewares=internal-api-auth
+      - traefik.http.middlewares.internal-api-auth.basicauth.users=${TRAEFIK_API_AUTH}
     logging:
       driver: json-file
       options:
         max-size: '10m'
         max-file: '5'
+
+  traefik-manager:
+    # Pin a version once you've checked the tags at ghcr.io/chr0nzz/traefik-manager
+    image: ${TM_IMAGE:-ghcr.io/chr0nzz/traefik-manager:latest}
+    container_name: traefik-manager
+    restart: unless-stopped
+    environment:
+      COOKIE_SECURE: 'true'
+      PUID: '1002'
+      PGID: '1002'
+      # Traefik API through the internal entrypoint above
+      TRAEFIK_API_URL: http://traefik:8080
+      TRAEFIK_API_USER: ${TRAEFIK_API_USER}
+      TRAEFIK_API_PASSWORD: ${TRAEFIK_API_PASSWORD}
+      # Every .yml in the file-provider directory (jenkins.yml + anything you add)
+      CONFIG_DIR: /app/dynamic
+      BACKUP_DIR: /app/backups
+      BACKUP_KEEP_COUNT: '30'
+      ACME_JSON_PATH: /app/letsencrypt/acme.json
+      ACCESS_LOG_PATH: /app/logs/access.log
+      DOMAINS: ${APP_DOMAIN}
+      CERT_RESOLVER: le
+      # No STATIC_CONFIG_PATH / RESTART_METHOD / Docker socket on purpose:
+      # Traefik's static config is the command list above, kept in git.
+    volumes:
+      - ./dynamic:/app/dynamic
+      - ./manager/config:/app/config
+      - ./manager/backups:/app/backups
+      # folders, not single files: a single-file mount can go stale when
+      # Traefik rewrites acme.json or the log is rotated
+      - ./letsencrypt:/app/letsencrypt:ro
+      - ./logs:/app/logs:ro
+    networks:
+      - traefik
+    depends_on:
+      traefik:
+        condition: service_healthy
+    labels:
+      - traefik.enable=true
+      - traefik.docker.network=traefik
+      - traefik.http.routers.traefik-manager.rule=Host(`${TM_DOMAIN}`)
+      - traefik.http.routers.traefik-manager.entrypoints=websecure
+      - traefik.http.routers.traefik-manager.tls.certresolver=le
+      - traefik.http.services.traefik-manager.loadbalancer.server.port=5000
+    logging:
+      driver: json-file
+      options:
+        max-size: '10m'
+        max-file: '3'
 
 networks:
   traefik:
