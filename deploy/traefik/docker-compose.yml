@@ -32,7 +32,7 @@ services:
       - --entrypoints.web.http.redirections.entrypoint.scheme=https
       - --entrypoints.websecure.address=:443
       # Internal-only entrypoint (no host port) where Traefik Manager reads the API
-      - --entrypoints.internal.address=:8080
+      - --entrypoints.traefik.address=:8080
       # Let's Encrypt
       - --certificatesresolvers.le.acme.email=${ACME_EMAIL}
       - --certificatesresolvers.le.acme.storage=/letsencrypt/acme.json
@@ -70,7 +70,7 @@ services:
       - traefik.enable=true
       # Traefik API for Traefik Manager: internal entrypoint only, own password
       - traefik.http.routers.internal-api.rule=PathPrefix(`/api`)
-      - traefik.http.routers.internal-api.entrypoints=internal
+      - traefik.http.routers.internal-api.entrypoints=traefik
       - traefik.http.routers.internal-api.service=api@internal
       - traefik.http.routers.internal-api.middlewares=internal-api-auth
       - traefik.http.middlewares.internal-api-auth.basicauth.users=${TRAEFIK_API_AUTH}
